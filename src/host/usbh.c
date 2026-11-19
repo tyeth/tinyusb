@@ -271,8 +271,12 @@ enum {
 static bool recheck_due(void) {
   switch (_usbh_data.recheck_state) {
     case RECHECK_PENDING:
+      // the probe needs the control slot; its completion event wakes the task otherwise
+      return _usbh_data.enumerating_daddr == TUSB_INDEX_INVALID_8 &&
+             _usbh_data.ctrl_xfer_info.stage == CONTROL_STAGE_IDLE && tu_fifo_empty(&_usbh_pending_ctrl_q);
     case RECHECK_REENUM_REQ:
-      return _usbh_data.enumerating_daddr == TUSB_INDEX_INVALID_8;
+      // after the port events already queued, so an older detach cannot undo the re-enumeration
+      return _usbh_data.enumerating_daddr == TUSB_INDEX_INVALID_8 && osal_queue_empty(_usbh_q);
     case RECHECK_REENUM:
       return _usbh_data.enumerating_daddr == TUSB_INDEX_INVALID_8 && _usbh_data.root_retry_count == 0;
     default:
@@ -508,6 +512,10 @@ TU_ATTR_ALWAYS_INLINE static inline void usbh_device_close(uint8_t rhport, uint8
     // clear enum delay function of the device being removed
     if (_usbh_data.call_after.func == enum_delay_async) {
       _usbh_data.call_after.func = NULL;
+      // only that delay clears a root port's debounce bit: left set, the port's attach/remove events are dropped
+      if (_usbh_data.dev0_bus.hub_addr == 0) {
+        _usbh_data.attach_debouncing_bm &= (uint8_t) ~TU_BIT(_usbh_data.dev0_bus.rhport);
+      }
     }
   }
 
@@ -960,6 +968,9 @@ static bool usbh_task_run(uint32_t timeout_ms, bool in_isr, bool stoppable) {
     // tuh_rhport_recheck(), only from tuh_task(): not from the nested polls of a synchronous control transfer
     if (stoppable) {
       recheck_process();
+      if (recheck_due()) {
+        timeout_ms = 0; // more recheck work is ready: do not wait for an unrelated event
+      }
     }
 
     // Process call_after_ms function if ms is reached
@@ -1123,7 +1134,14 @@ static void recheck_process(void) {
           _usbh_data.recheck_state = RECHECK_PROBING;
           if (!tuh_descriptor_get_device(daddr, _usbh_epbuf.recheck, sizeof(tusb_desc_device_t), recheck_root_complete,
                                          0)) {
-            _usbh_data.recheck_state = RECHECK_REENUM_REQ;
+            if (!tuh_connected(daddr)) {
+              recheck_finish(); // closed meanwhile
+            } else if (_usbh_data.ctrl_xfer_info.stage != CONTROL_STAGE_IDLE ||
+                       !tu_fifo_empty(&_usbh_pending_ctrl_q)) {
+              _usbh_data.recheck_state = RECHECK_PENDING; // another task took the control slot: try again later
+            } else {
+              _usbh_data.recheck_state = RECHECK_REENUM_REQ; // the probe could not be sent to the device
+            }
           }
           return; // one device per root port; a hub reports what changed behind it through its own port status
         }
@@ -1140,9 +1158,15 @@ static void recheck_process(void) {
     case RECHECK_REENUM_REQ: {
       // What the HCD's attach event does, run from the task instead of queued (a queue send can block): remove what
       // is on the port, reset it and enumerate. The debounce bit drops the HCD's own attach events meanwhile.
+      // From here the HCD's attach/remove events are dropped, as for any root port attach. One that came in before
+      // the bit was set is in the queue: handle it first.
+      _usbh_data.attach_debouncing_bm |= TU_BIT(rhport);
+      if (!osal_queue_empty(_usbh_q)) {
+        _usbh_data.attach_debouncing_bm &= (uint8_t) ~TU_BIT(rhport);
+        return;
+      }
       TU_LOG_USBH("[%u] Re-check: re-enumerating\r\n", rhport);
       _usbh_data.recheck_state = RECHECK_REENUM;
-      _usbh_data.attach_debouncing_bm |= TU_BIT(rhport);
       hcd_event_t event = {0};
       event.rhport              = rhport;
       event.event_id            = HCD_EVENT_DEVICE_ATTACH;
@@ -1162,7 +1186,7 @@ static void recheck_process(void) {
 }
 
 bool tuh_rhport_recheck(uint8_t rhport) {
-  TU_VERIFY(tuh_rhport_is_active(rhport));
+  TU_VERIFY(tuh_inited() && tuh_rhport_is_active(rhport));
   (void) osal_mutex_lock(_usbh_mutex, OSAL_TIMEOUT_WAIT_FOREVER);
   if (_usbh_data.recheck_state == RECHECK_IDLE) {
     _usbh_data.recheck_state = RECHECK_PENDING;
@@ -1181,7 +1205,7 @@ bool tuh_rhport_recheck(uint8_t rhport) {
 }
 
 bool tuh_rhport_recheck_busy(uint8_t rhport) {
-  return tuh_rhport_is_active(rhport) && _usbh_data.recheck_state != RECHECK_IDLE;
+  return tuh_inited() && tuh_rhport_is_active(rhport) && _usbh_data.recheck_state != RECHECK_IDLE;
 }
 #else
 static void recheck_process(void) {}
