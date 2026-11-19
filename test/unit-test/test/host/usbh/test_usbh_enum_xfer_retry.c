@@ -463,3 +463,47 @@ void test_resend_not_queued_resets_port(void) {
   TEST_ASSERT_EQUAL(ENUM_AFTER_DEBOUNCING_DELAY, _usbh_data.call_after.arg);
   TEST_ASSERT_EQUAL_UINT8(1, _usbh_data.enum_attempt);
 }
+
+// This test sets CFG_TUH_ENUM_RETRY_DELAY_MS to 700 (project.yml), a non-default value, so a retry that fell back to
+// the 150 ms attach debounce would fail below
+TU_VERIFY_STATIC(CFG_TUH_ENUM_RETRY_DELAY_MS == 700, "test_usbh_enum_xfer_retry expects CFG_TUH_ENUM_RETRY_DELAY_MS=700");
+
+// The first enumeration after an attach still waits only the 150 ms debounce
+void test_first_attach_waits_debounce(void) {
+  port_connected = true;
+  hcd_event_device_attach(RHPORT, false);
+  process_next_event();
+  TEST_ASSERT_EQUAL(ENUM_AFTER_DEBOUNCING_DELAY, _usbh_data.call_after.arg);
+  TEST_ASSERT_EQUAL_UINT32(150, pending_delay_ms());
+}
+
+// A failed attempt is reset again after CFG_TUH_ENUM_RETRY_DELAY_MS, not the debounce
+void test_enum_retry_waits_retry_delay(void) {
+  send_first_request();
+  for (uint32_t i = 1; i < ENUM_XFER_ATTEMPT_MAX; i++) {
+    request_fails();
+    fire_delay();
+  }
+  request_fails();
+
+  TEST_ASSERT_EQUAL(ENUM_AFTER_DEBOUNCING_DELAY, _usbh_data.call_after.arg);
+  TEST_ASSERT_EQUAL_UINT8(1, _usbh_data.enum_attempt);
+  TEST_ASSERT_EQUAL_UINT32(700, pending_delay_ms());
+}
+
+// When the attempts are used up, the root port retry's new attach also waits CFG_TUH_ENUM_RETRY_DELAY_MS
+void test_root_retry_waits_retry_delay(void) {
+  send_first_request();
+  _usbh_data.enum_attempt = CFG_TUH_ENUM_ATTEMPT_MAX - 1;
+  for (uint32_t i = 1; i < ENUM_XFER_ATTEMPT_MAX; i++) {
+    request_fails();
+    fire_delay();
+  }
+  request_fails();
+
+  TEST_ASSERT_EQUAL_UINT8(1, _usbh_data.root_retry_count);
+  TEST_ASSERT_FALSE(osal_queue_empty(_usbh_q));
+  process_next_event(); // the root port retry's attach
+  TEST_ASSERT_EQUAL(ENUM_AFTER_DEBOUNCING_DELAY, _usbh_data.call_after.arg);
+  TEST_ASSERT_EQUAL_UINT32(700, pending_delay_ms());
+}
